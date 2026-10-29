@@ -17,7 +17,7 @@
 
 //! Integration tests for Iceberg Datafusion with Hive Metastore.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::sync::Arc;
 use std::vec;
@@ -54,15 +54,36 @@ use iceberg_datafusion::write::{IcebergCommitExec, IcebergWriteExec};
 use iceberg_datafusion::{
     IcebergCatalogProvider, IcebergCatalogTableProvider, IcebergStaticTableProvider,
 };
+use serde_json::Value;
 use tempfile::TempDir;
 
 fn display_schema(schema: &ArrowSchema) -> String {
     schema
         .fields()
         .iter()
-        .map(ToString::to_string)
+        .map(|field| display_field(field))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// This turns `Field` into a `String`,
+/// whilst also keeping the `metadata` in order.
+///
+/// `Field::metadata` is a `HashMap`, and so printing it causes data to come out
+/// in a random order, which breaks `insta` snapshots.
+fn display_field(field: &Field) -> String {
+    let sorted_metadata = field.metadata().iter().collect::<BTreeMap<_, _>>();
+    let metadata_str = Some(&sorted_metadata)
+        .filter(|metadata| !metadata.is_empty())
+        .map(|metadata| format!(", metadata: {metadata:?}"))
+        .unwrap_or_default();
+
+    let without_metadata = field.clone().with_metadata(HashMap::new()).to_string();
+    let without_closing = without_metadata
+        .strip_suffix(" }")
+        .expect("Field display always ends with a closing brace");
+
+    format!("{without_closing}{metadata_str} }}")
 }
 
 fn temp_path() -> String {
@@ -703,7 +724,7 @@ async fn test_insert_into_nested() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
-async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
+async fn test_insert_into_partitioned_by_string() -> Result<(), Box<dyn Error>> {
     let iceberg_catalog = get_iceberg_catalog().await;
     let namespace = NamespaceIdent::new("test_partitioned_write".to_string());
     set_test_namespace(&iceberg_catalog, &namespace).await?;
@@ -893,6 +914,132 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
     );
 
     Ok(())
+}
+
+#[tokio::test]
+async fn test_insert_into_partitioned_by_uuid() -> Result<(), Box<dyn Error>> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_insert_uuid".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "uuid", Type::Primitive(PrimitiveType::Uuid)).into(),
+        ])
+        .build()?;
+
+    let creation = TableCreation::builder()
+        .location(temp_path())
+        .name("partitioned_table".to_string())
+        .properties(HashMap::new())
+        .schema(schema)
+        .partition_spec(
+            UnboundPartitionSpec::builder()
+                .with_spec_id(0)
+                .add_partition_fields([UnboundPartitionField::builder()
+                    .source_ids(vec![2])
+                    .field_id(2)
+                    .name("uuid".to_string())
+                    .transform(Transform::Identity)
+                    .build()
+                    .unwrap()])
+                .unwrap()
+                .build(),
+        )
+        .build();
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // Assert that retrieving data has the correct schema,
+    // and the data is present.
+    ctx.sql(
+        "INSERT INTO catalog.test_insert_uuid.partitioned_table
+         VALUES (1, X'aaaaaaaabbbbccccddddeeeeeeeeeeee')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let batches = ctx
+        .sql("SELECT * FROM catalog.test_insert_uuid.partitioned_table")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    insta::assert_snapshot!(display_schema(&batches[0].schema()), @r#"
+    Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} }
+    Field { "uuid": FixedSizeBinary(16), metadata: {"ARROW:extension:name": "arrow.uuid", "PARQUET:field_id": "2"} }
+    "#);
+    insta::assert_snapshot!(pretty_format_batches(&batches)?.to_string(), @r#"
+    +----+----------------------------------+
+    | id | uuid                             |
+    +----+----------------------------------+
+    | 1  | aaaaaaaabbbbccccddddeeeeeeeeeeee |
+    +----+----------------------------------+
+    "#);
+
+    // Assert the that data files exist under correct UUID path.
+    let table_ident = TableIdent::new(namespace.clone(), "partitioned_table".to_string());
+    let table = client.load_table(&table_ident).await?;
+    let table_location = table.metadata().location();
+    let file_io = table.file_io();
+    let uuid_partition_path =
+        format!("{table_location}/data/uuid=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+
+    assert!(
+        file_io.exists(&uuid_partition_path).await?,
+        "Expected partition directory: {uuid_partition_path}"
+    );
+
+    // Assert the UUID partition is stored in the correct format.
+    //
+    // This is done by:
+    //  1. read the raw Avro schema,
+    //  2. get out the UUID partition in the schema,
+    //  3. and then assert the schema is in the correct format.
+    //
+    let snapshot = table.metadata().current_snapshot().unwrap();
+    let manifest_list = table.manifest_list_reader(snapshot).load().await?;
+    let manifest_path = &manifest_list.entries()[0].manifest_path;
+    let manifest_bytes = file_io.new_input(manifest_path)?.read().await?;
+    let manifest_avro_schema = apache_avro::Reader::new(&*manifest_bytes)
+        .unwrap()
+        .writer_schema()
+        .clone();
+    let manifest_avro_schema = serde_json::to_value(&manifest_avro_schema).unwrap();
+    let data_file = find_field_in_json_array(&manifest_avro_schema, "data_file");
+    let partition = find_field_in_json_array(&data_file, "partition");
+    let uuid_field = find_field_in_json_array(&partition, "uuid");
+
+    assert_eq!(
+        uuid_field,
+        serde_json::json!([
+            "null",
+            {"type": "fixed", "size": 16, "name": "uuid_fixed", "logicalType": "uuid"}
+        ]),
+        "expected uuid partition to be written as an Avro fixed(16)"
+    );
+
+    Ok(())
+}
+
+fn find_field_in_json_array(schema: &Value, name: &str) -> Value {
+    schema["fields"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a record schema, got {schema}"))
+        .iter()
+        .find(|field| field["name"] == name)
+        .unwrap_or_else(|| panic!("no field named {name} in {schema}"))["type"]
+        .clone()
 }
 
 /// Executes `plan`, which must have a single partition, and returns its rows.
